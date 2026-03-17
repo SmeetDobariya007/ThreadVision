@@ -1,0 +1,14 @@
+# requirements.txt — ThreadVision AI Dependencies
+# Install: pip install -r requirements.txt
+
+# === Cross-platform dependencies ===
+opencv-python>=4.8.0
+numpy>=1.24.0
+scipy>=1.11.0
+customtkinter>=5.2.0
+Pillow>=10.0.0
+pandas>=2.0.0
+
+# === Raspberry Pi ONLY (uncomment on Pi) ===
+# picamera2>=0.3.12
+# RPi.GPIO>=0.7.1

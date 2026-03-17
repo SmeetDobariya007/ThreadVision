@@ -1,0 +1,16 @@
+[Unit]
+Description=ThreadVision AI Inspection System
+After=graphical.target
+Wants=graphical.target
+
+[Service]
+User=pi
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/pi/.Xauthority
+WorkingDirectory=/home/pi/threadvision
+ExecStart=/usr/bin/python3 /home/pi/threadvision/main.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical.target
