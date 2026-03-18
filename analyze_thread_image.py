@@ -156,24 +156,26 @@ def preprocess(image, mode):
 
 def _find_bolt_contour(edges, image_shape, PIXEL_TO_MM):
     contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    valid = []
+    valid_conts = []
     for c in contours:
         x, y, w, h = cv2.boundingRect(c)
         area = w * h
         frame_area = image_shape[0] * image_shape[1]
-        if area < frame_area * 0.005:
-            continue
-        width_mm = w / PIXEL_TO_MM
-        height_mm = h / PIXEL_TO_MM
-        if not (BOLT_WIDTH_MIN_MM <= width_mm <= BOLT_WIDTH_MAX_MM):
-            continue
-        if h < w:
-            continue
-        valid.append((area, c, x, y, w, h))
-    if not valid:
+        
+        # Valid shred criteria
+        if area > frame_area * 0.005 and (w > image_shape[1] * 0.1 or h > image_shape[0] * 0.1):
+            # Skip the ArUco marker which has an aspect ratio near 1.0!
+            if 0.8 < w / h < 1.2:
+                continue
+            valid_conts.append(c)
+
+    if not valid_conts:
         raise BoltNotFoundError("No valid bolt contour found in image.")
-    valid.sort(key=lambda t: t[0], reverse=True)
-    return valid[0][1:]
+    merged = np.vstack(valid_conts)
+    best_c = cv2.convexHull(merged)
+    x, y, w, h = cv2.boundingRect(best_c)
+    area = w * h
+    return best_c, x, y, w, h
 
 def _measure_major_diameter(gray, bbox, PIXEL_TO_MM):
     c, x, y, w, h = bbox
