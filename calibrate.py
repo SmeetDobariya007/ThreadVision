@@ -469,6 +469,49 @@ class CalibrationTool:
             print(f"  ⚠ Could not log calibration: {e}")
 
 
+class CalibrationError(Exception): pass
+
+def detect_aruco_scale(image, marker_size_mm):
+    from cv2 import aruco
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+
+    aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
+    parameters = aruco.DetectorParameters()
+    detector = aruco.ArucoDetector(aruco_dict, parameters)
+
+    corners, ids, rejected = detector.detectMarkers(gray)
+
+    if ids is None:
+        raise CalibrationError("ArUco marker not found in image.")
+
+    marker_idx = np.where(ids == 0)[0]
+    if len(marker_idx) > 0:
+        pts = corners[marker_idx[0]][0]
+    else:
+        pts = corners[0][0]
+
+    side_0 = np.linalg.norm(pts[0] - pts[1])
+    side_1 = np.linalg.norm(pts[1] - pts[2])
+    side_2 = np.linalg.norm(pts[2] - pts[3])
+    side_3 = np.linalg.norm(pts[3] - pts[0])
+
+    sides = np.sort([side_0, side_1, side_2, side_3])
+    size_px = np.mean(sides[1:3])
+
+    mm_per_pixel = marker_size_mm / size_px
+
+    # Calculate confidence based on perspective skew
+    max_skew = abs(side_0 - side_2) + abs(side_1 - side_3)
+    if max_skew < 5:
+        confidence = "HIGH"
+    elif max_skew < 15:
+        confidence = "MEDIUM"
+    else:
+        confidence = "LOW (High perspective distortion)"
+
+    return mm_per_pixel, confidence, pts
+
+
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
@@ -493,7 +536,7 @@ def main():
 
     print()
     print("╔══════════════════════════════════════════════════╗")
-    print("║       ThreadVision AI — Calibration Tool        ║")
+    print("║       ThreadVision AI — Calibration Tool         ║")
     print("╚══════════════════════════════════════════════════╝")
     print()
 

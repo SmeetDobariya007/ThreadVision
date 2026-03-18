@@ -151,13 +151,13 @@ class ThreadVisionGUI:
 
         # Calibration value display
         um_per_px = 1e3 / PIXEL_TO_MM
-        cal_label = ctk.CTkLabel(
+        self.cal_label = ctk.CTkLabel(
             self.top_bar,
             text=f"Cal: {PIXEL_TO_MM:.1f} px/mm ({um_per_px:.1f} µm/px)",
             font=ctk.CTkFont(size=11),
             text_color=COLOR_TEXT_DIM,
         )
-        cal_label.pack(side="right", padx=10, pady=10)
+        self.cal_label.pack(side="right", padx=10, pady=10)
 
         # Middle content area
         self.content_frame = ctk.CTkFrame(self.root, fg_color=COLOR_BG)
@@ -416,6 +416,8 @@ class ThreadVisionGUI:
             from measurement import measure, MeasurementError
             from inspector import check, trigger_gpio
             from logger import save_inspection
+            from config import ARUCO_MARKER_SIZE_MM, PIXEL_TO_MM
+            from calibrate import detect_aruco_scale
 
             # Step 1: Capture full-resolution frame
             if self._camera is not None:
@@ -425,11 +427,33 @@ class ThreadVisionGUI:
                 frame = cam.capture_frame()
                 cam.release()
 
+            # Step 1.5: Dynamic ArUco Calibration
+            p2mm = PIXEL_TO_MM
+            try:
+                mm_per_pixel, conf, _ = detect_aruco_scale(frame, ARUCO_MARKER_SIZE_MM)
+                p2mm = 1.0 / mm_per_pixel
+                logger.info(f"ArUco Auto-Calibrated: {p2mm:.2f} px/mm (Confidence: {conf})")
+                is_live_cal = True
+            except Exception as e:
+                logger.warning(f"ArUco calibration not found or failed, using static fallback: {e}")
+                is_live_cal = False
+
+            # Update calibration UI on main thread safely
+            def update_cal_ui(p2mm_val, is_live):
+                um_px = 1e3 / p2mm_val if p2mm_val else 0
+                color = COLOR_PASS if is_live else COLOR_WARNING
+                flag = "LIVE CAL: " if is_live else "AUTO FALLBACK: "
+                self.cal_label.configure(
+                    text=f"{flag}{p2mm_val:.1f} px/mm ({um_px:.1f} µm/px)",
+                    text_color=color
+                )
+            self.root.after(0, lambda p=p2mm, l=is_live_cal: update_cal_ui(p, l))
+
             # Step 2: Preprocess
             edges, gray = preprocess(frame)
 
             # Step 3: Measure
-            measurements = measure(edges, gray)
+            measurements = measure(edges, gray, pixel_to_mm=p2mm)
 
             # Step 4: Inspect
             result, overall_str = check(measurements)

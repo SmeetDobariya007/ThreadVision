@@ -3,20 +3,28 @@
 # Converts a raw BGR camera frame into edge-detected and enhanced
 # grayscale images ready for measurement extraction.
 #
-# Pipeline: BGR → Grayscale → Gaussian Blur → CLAHE → Canny Edges
+# FIXES IN THIS VERSION:
+#   - Adaptive Canny thresholds derived from Otsu's method per image
+#     (old version used fixed CANNY_LOW=50 / HIGH=150 from config,
+#     which over/under-segments depending on image contrast)
+#   - Noise assessment via Laplacian variance → CLEAN / MODERATE / NOISY
+#   - NOISY path uses FastNlMeansDenoising before blurring
+#   - MODERATE/NOISY paths derive thresholds from Otsu, not config constants
+#   - Fixed CLAHE constants from config still used for CLEAN images
 #
 # Usage:
 #   from preprocessor import preprocess
 #   edges, gray = preprocess(frame)
+#   edges, gray = preprocess(frame, force_mode="NOISY")
 
 import logging
 import numpy as np
 import cv2
 
 from config import (
-    CANNY_LOW, CANNY_HIGH,
     BLUR_KERNEL,
     CLAHE_CLIP, CLAHE_GRID,
+    CANNY_LOW, CANNY_HIGH,   # used as fallback for CLEAN images
 )
 
 logger = logging.getLogger("ThreadVision.preprocessor")
@@ -27,162 +35,227 @@ class PreprocessingError(Exception):
     pass
 
 
-def preprocess(frame):
+# =========================================================================
+# Public API
+# =========================================================================
+
+def preprocess(frame, force_mode=None):
     """
-    Full image preprocessing pipeline for thread inspection.
+    Full adaptive preprocessing pipeline for thread inspection.
 
-    Converts a raw BGR camera frame through a multi-stage pipeline
-    optimized for extracting thread geometry from backlit silhouettes:
-
-    1. **Grayscale conversion**: Reduces 3-channel BGR to single channel.
-    2. **Gaussian blur**: Reduces high-frequency noise that causes
-       false edge detections. Kernel size from config.py.
-    3. **CLAHE** (Contrast Limited Adaptive Histogram Equalization):
-       Enhances local contrast so thread features at bolt edges
-       are as sharp as the centre. Critical for uniform edge detection
-       across the full image.
-    4. **Canny edge detection**: Produces binary edge map with
-       hysteresis thresholding. Low/high thresholds from config.py.
+    Noise is assessed via the Laplacian variance of the grayscale image:
+      CLEAN    (var > 500): GaussianBlur + fixed Canny
+      MODERATE (var > 100): GaussianBlur + Otsu-derived Canny
+      NOISY    (var ≤ 100): FastNlMeansDenoising + GaussianBlur +
+                            Otsu-derived Canny + morphological close
 
     Args:
-        frame (np.ndarray): BGR image from camera (any resolution).
-                            Must be a valid 3-channel uint8 image.
+        frame (np.ndarray): BGR image from camera (uint8, 3-channel).
+        force_mode (str):   Optional override: 'CLEAN', 'MODERATE', or 'NOISY'.
+                            When None (default), mode is auto-detected.
 
     Returns:
-        tuple: (edges, gray) where:
-            - edges (np.ndarray): Binary edge map (uint8, 0 or 255).
-                                  Same size as input frame.
-            - gray (np.ndarray): Enhanced grayscale image (uint8).
-                                 CLAHE-equalized, suitable for
-                                 intensity profiling in measurement.py.
+        tuple: (edges, gray) where
+            edges (np.ndarray): Binary edge map, same size as input (uint8).
+            gray  (np.ndarray): CLAHE-enhanced grayscale, same size (uint8).
 
     Raises:
-        PreprocessingError: If input frame is None, empty, or invalid.
+        PreprocessingError: If input is None, empty, or wrong type.
     """
-    # === Input validation ===
-    if frame is None:
-        raise PreprocessingError("Input frame is None — camera may have failed.")
+    gray = _validate_and_to_gray(frame)
 
-    if not isinstance(frame, np.ndarray):
-        raise PreprocessingError(
-            f"Expected np.ndarray, got {type(frame).__name__}."
-        )
-
-    if frame.size == 0:
-        raise PreprocessingError("Input frame is empty (0 pixels).")
-
-    if frame.ndim not in (2, 3):
-        raise PreprocessingError(
-            f"Expected 2D or 3D array, got {frame.ndim}D (shape: {frame.shape})."
-        )
-
-    logger.info(f"Preprocessing frame: {frame.shape[1]}×{frame.shape[0]}")
-
-    # === Step 1: Convert to grayscale ===
-    if frame.ndim == 3 and frame.shape[2] == 3:
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    elif frame.ndim == 3 and frame.shape[2] == 4:
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGRA2GRAY)
-    elif frame.ndim == 2:
-        gray = frame.copy()
+    noise_var, mode = assess_noise(gray)
+    if force_mode is not None:
+        mode = force_mode.upper()
+        logger.info(f"Preprocessing mode forced to: {mode}")
     else:
-        raise PreprocessingError(
-            f"Unsupported channel count: {frame.shape[2]}."
-        )
-    logger.debug("  Step 1: Grayscale conversion done.")
-
-    # === Step 2: Gaussian blur ===
-    # Reduces sensor noise and minor texture that would create false edges.
-    # Kernel must be odd — config.py specifies (5, 5) by default.
-    blurred = cv2.GaussianBlur(gray, BLUR_KERNEL, sigmaX=0)
-    logger.debug(f"  Step 2: Gaussian blur applied (kernel={BLUR_KERNEL}).")
-
-    # === Step 3: CLAHE (Contrast Limited Adaptive Histogram Equalization) ===
-    # Standard histogram equalization can blow out contrast globally.
-    # CLAHE operates on tiles, so thread edges at the periphery of the
-    # image get the same contrast boost as the centre.
-    clahe = cv2.createCLAHE(clipLimit=CLAHE_CLIP, tileGridSize=CLAHE_GRID)
-    enhanced = clahe.apply(blurred)
-    logger.debug(
-        f"  Step 3: CLAHE applied (clip={CLAHE_CLIP}, grid={CLAHE_GRID})."
-    )
-
-    # === Step 4: Canny edge detection ===
-    # Hysteresis thresholds: edges above CANNY_HIGH are kept. Edges between
-    # CANNY_LOW and CANNY_HIGH are kept only if connected to strong edges.
-    # This suppresses noise while preserving thread flanks.
-    edges = cv2.Canny(enhanced, CANNY_LOW, CANNY_HIGH)
-    logger.debug(
-        f"  Step 4: Canny edges detected (low={CANNY_LOW}, high={CANNY_HIGH})."
-    )
-
-    # Count edge pixels for diagnostic logging
-    edge_count = np.count_nonzero(edges)
-    total_pixels = edges.shape[0] * edges.shape[1]
-    edge_ratio = edge_count / total_pixels * 100
-    logger.info(
-        f"  Result: {edge_count} edge pixels ({edge_ratio:.1f}% of frame)."
-    )
-
-    # Sanity check: if too few edges, image may be blank or overexposed
-    if edge_ratio < 0.1:
-        logger.warning(
-            "Very few edges detected (<0.1%). Image may be blank or "
-            "severely overexposed. Check backlight and bolt placement."
+        logger.info(
+            f"Preprocessing mode: {mode}  (Laplacian var={noise_var:.1f})"
         )
 
-    # Sanity check: if too many edges, image may be underexposed or noisy
-    if edge_ratio > 30.0:
+    if mode == "CLEAN":
+        edges, enhanced = _pipeline_clean(gray)
+    elif mode == "MODERATE":
+        edges, enhanced = _pipeline_moderate(gray)
+    else:                              # NOISY
+        edges, enhanced = _pipeline_noisy(gray)
+
+    # Diagnostic
+    edge_count = int(np.count_nonzero(edges))
+    total_px   = edges.shape[0] * edges.shape[1]
+    edge_pct   = edge_count / total_px * 100
+    logger.info(f"  Edges: {edge_count} px ({edge_pct:.2f}% of frame)")
+
+    if edge_pct < 0.1:
         logger.warning(
-            "Too many edges detected (>30%). Image may be underexposed "
-            "or noisy. Check backlight intensity."
+            "Very few edges detected (<0.1%). "
+            "Image may be blank or overexposed."
+        )
+    if edge_pct > 30.0:
+        logger.warning(
+            "Too many edges (>30%). "
+            "Image may be underexposed or noisy."
         )
 
     return edges, enhanced
 
 
+def assess_noise(gray_image):
+    """
+    Estimate image noise level via Laplacian variance.
+
+    High variance ↔ sharp edges, low noise (CLEAN).
+    Low variance  ↔ blurry or high noise (NOISY).
+
+    Args:
+        gray_image (np.ndarray): Single-channel uint8 image.
+
+    Returns:
+        tuple: (laplacian_variance: float, mode: str)
+               mode is one of 'CLEAN', 'MODERATE', 'NOISY'.
+    """
+    lap_var = cv2.Laplacian(gray_image, cv2.CV_64F).var()
+    if lap_var > 500:
+        return lap_var, "CLEAN"
+    elif lap_var > 100:
+        return lap_var, "MODERATE"
+    else:
+        return lap_var, "NOISY"
+
+
+# =========================================================================
+# Private pipeline implementations
+# =========================================================================
+
+def _pipeline_clean(gray):
+    """
+    Fast pipeline for sharp, well-lit images.
+
+    Uses fixed Canny thresholds from config — they work reliably when
+    contrast is already high.
+    """
+    blurred = cv2.GaussianBlur(gray, BLUR_KERNEL, sigmaX=1.0)
+    enhanced = _apply_clahe(blurred)
+    edges = cv2.Canny(enhanced, CANNY_LOW, CANNY_HIGH)
+    logger.debug(f"  CLEAN: Canny({CANNY_LOW}, {CANNY_HIGH})")
+    return edges, enhanced
+
+
+def _pipeline_moderate(gray):
+    """
+    Standard pipeline for average-contrast images.
+
+    Derives Canny thresholds from Otsu's method so the detector
+    self-calibrates to each image's actual contrast range.
+    Otsu threshold → high = otsu, low = 0.5 × otsu.
+    """
+    blurred = cv2.GaussianBlur(gray, (7, 7), sigmaX=1.5)
+    enhanced = _apply_clahe(blurred)
+
+    otsu_val, _ = cv2.threshold(
+        enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+    )
+    low  = max(1.0, otsu_val * 0.5)
+    high = otsu_val
+    edges = cv2.Canny(enhanced, low, high)
+    logger.debug(f"  MODERATE: Otsu={otsu_val:.0f}, Canny({low:.0f}, {high:.0f})")
+    return edges, enhanced
+
+
+def _pipeline_noisy(gray):
+    """
+    Aggressive pipeline for grainy / low-contrast images.
+
+    1. FastNlMeansDenoising removes sensor noise before blurring.
+    2. Larger Gaussian kernel further smooths residual noise.
+    3. Lower Otsu multipliers keep more of the faint thread edges.
+    4. Morphological close fills small gaps in thread-edge segments.
+    """
+    # Step 1: Non-local means denoising (slow but thorough)
+    denoised = cv2.fastNlMeansDenoising(
+        gray, h=15, templateWindowSize=7, searchWindowSize=21
+    )
+
+    # Step 2: Gaussian blur on the denoised image
+    blurred = cv2.GaussianBlur(denoised, (9, 9), sigmaX=2.0)
+    enhanced = _apply_clahe(blurred)
+
+    # Step 3: Otsu-derived Canny with lower thresholds to retain faint edges
+    otsu_val, _ = cv2.threshold(
+        enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+    )
+    low  = max(1.0, otsu_val * 0.3)
+    high = otsu_val * 0.8
+    edges = cv2.Canny(enhanced, low, high)
+
+    # Step 4: Morphological close — fills small gaps in thread-edge lines
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    edges  = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
+
+    logger.debug(f"  NOISY: Otsu={otsu_val:.0f}, Canny({low:.0f}, {high:.0f}), morph-close")
+    return edges, enhanced
+
+
+def _apply_clahe(gray):
+    """Apply CLAHE using constants from config."""
+    clahe = cv2.createCLAHE(clipLimit=CLAHE_CLIP, tileGridSize=CLAHE_GRID)
+    return clahe.apply(gray)
+
+
+def _validate_and_to_gray(frame):
+    """Validate input and convert to grayscale."""
+    if frame is None:
+        raise PreprocessingError("Input frame is None — camera may have failed.")
+    if not isinstance(frame, np.ndarray):
+        raise PreprocessingError(
+            f"Expected np.ndarray, got {type(frame).__name__}."
+        )
+    if frame.size == 0:
+        raise PreprocessingError("Input frame is empty (0 pixels).")
+    if frame.ndim not in (2, 3):
+        raise PreprocessingError(
+            f"Expected 2D or 3D array, got {frame.ndim}D."
+        )
+    if frame.ndim == 3 and frame.shape[2] == 3:
+        return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    if frame.ndim == 3 and frame.shape[2] == 4:
+        return cv2.cvtColor(frame, cv2.COLOR_BGRA2GRAY)
+    if frame.ndim == 2:
+        return frame.copy()
+    raise PreprocessingError(f"Unsupported channel count: {frame.shape[2]}")
+
+
+# =========================================================================
+# Display helpers (unchanged)
+# =========================================================================
+
 def preprocess_for_display(edges, gray, original_frame=None):
     """
     Create annotated images suitable for GUI display.
 
-    Generates colored overlays that help the operator visually verify
-    that edges are being detected on the actual thread features.
-
-    Args:
-        edges (np.ndarray): Binary edge map from preprocess().
-        gray (np.ndarray): Enhanced grayscale from preprocess().
-        original_frame (np.ndarray, optional): Original BGR frame for overlay.
-
     Returns:
-        dict: Dictionary with display images:
-            - 'edges_colored': Edge map as green-on-black BGR image.
-            - 'overlay': Edges overlaid on original frame (if provided).
-            - 'enhanced': CLAHE-enhanced grayscale as BGR.
+        dict: 'edges_colored', 'enhanced', and optionally 'overlay'.
     """
     result = {}
 
-    # Edge map as green lines on black background
     edges_colored = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
-    edges_colored[:, :, 0] = 0   # Zero blue channel
-    edges_colored[:, :, 2] = 0   # Zero red channel
+    edges_colored[:, :, 0] = 0
+    edges_colored[:, :, 2] = 0
     result['edges_colored'] = edges_colored
-
-    # Enhanced grayscale as BGR (for display in color GUI)
     result['enhanced'] = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
 
-    # Overlay edges on original frame
     if original_frame is not None:
         overlay = original_frame.copy()
-        # Draw edges as bright green on the original image
         overlay[edges > 0] = (0, 255, 0)
         result['overlay'] = overlay
 
     return result
 
 
-# ---------------------------------------------------------------------------
-# Self-test: run `python preprocessor.py` to test with a synthetic image
-# ---------------------------------------------------------------------------
+# =========================================================================
+# Self-test
+# =========================================================================
+
 if __name__ == "__main__":
     import sys
 
@@ -192,41 +265,38 @@ if __name__ == "__main__":
     print("ThreadVision AI — Preprocessor Self-Test")
     print("=" * 60)
 
-    # Generate or load a test image
+    # ── Test 1: CLEAN image ──────────────────────────────────────────
+    print("\n--- Test 1: CLEAN synthetic image ---")
+    clean = np.full((480, 640, 3), 200, dtype=np.uint8)
+    cv2.rectangle(clean, (280, 50), (360, 430), (20, 20, 20), -1)
+    edges, gray = preprocess(clean)
+    assert edges.shape == (480, 640), "Shape mismatch"
+    print(f"  ✓ edges shape: {edges.shape}, edge px: {np.count_nonzero(edges)}")
+
+    # ── Test 2: NOISY image ──────────────────────────────────────────
+    print("\n--- Test 2: NOISY synthetic image ---")
+    noisy = clean.copy()
+    noise = np.random.normal(0, 40, noisy.shape).astype(np.int16)
+    noisy = np.clip(noisy.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+    gray_noisy = cv2.cvtColor(noisy, cv2.COLOR_BGR2GRAY)
+    lap_var, mode = assess_noise(gray_noisy)
+    print(f"  Laplacian var={lap_var:.1f}, mode={mode}")
+    edges_n, gray_n = preprocess(noisy)
+    print(f"  ✓ NOISY edges: {np.count_nonzero(edges_n)} px")
+
+    # ── Test 3: force_mode override ──────────────────────────────────
+    print("\n--- Test 3: force_mode='NOISY' on clean image ---")
+    edges_f, _ = preprocess(clean, force_mode="NOISY")
+    print(f"  ✓ forced NOISY mode ran without error, "
+          f"edges={np.count_nonzero(edges_f)} px")
+
+    # ── Test 4: None input raises ─────────────────────────────────────
+    print("\n--- Test 4: None input ---")
     try:
-        from capture import CameraManager
-        cam = CameraManager()
-        frame = cam.capture_frame()
-        cam.release()
-        print(f"  Using camera frame: {frame.shape[1]}×{frame.shape[0]}")
-    except Exception:
-        # Create a synthetic test image
-        print("  No camera — generating synthetic test image...")
-        frame = np.full((480, 640, 3), 200, dtype=np.uint8)
-        # Draw a dark rectangle (bolt simulation)
-        cv2.rectangle(frame, (280, 50), (360, 430), (30, 30, 30), -1)
-        # Add some thread-like horizontal lines
-        for y in range(70, 420, 25):
-            cv2.line(frame, (270, y), (370, y), (100, 100, 100), 1)
-
-    # Run preprocessing
-    try:
-        edges, gray = preprocess(frame)
-        print(f"  Edges shape  : {edges.shape}")
-        print(f"  Gray shape   : {gray.shape}")
-        print(f"  Edge pixels  : {np.count_nonzero(edges)}")
-
-        # Save results
-        cv2.imwrite("test_edges.png", edges)
-        cv2.imwrite("test_gray_enhanced.png", gray)
-        print("  Saved: test_edges.png, test_gray_enhanced.png")
-
-        # Test display helpers
-        displays = preprocess_for_display(edges, gray, frame)
-        cv2.imwrite("test_overlay.png", displays.get('overlay', edges))
-        print("  Saved: test_overlay.png")
-
-        print("\n✓ Preprocessor test passed.")
-    except PreprocessingError as e:
-        print(f"\n✗ Preprocessing error: {e}", file=sys.stderr)
+        preprocess(None)
+        print("  ✗ Should have raised PreprocessingError")
         sys.exit(1)
+    except PreprocessingError:
+        print("  ✓ PreprocessingError raised correctly")
+
+    print("\n✓ All preprocessor self-tests passed.")

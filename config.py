@@ -18,6 +18,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PIXEL_TO_MM = 120.0   # pixels per mm — SET THIS WITH calibrate.py BEFORE USE
                        # Approximate starting value only. Must be measured empirically.
                        # Valid range: 80–200 px/mm for Pi Cam v2 at macro distances.
+ARUCO_MARKER_SIZE_MM = 50.0  # Physical side length of printed ArUco marker (DICT_4X4_50)
 
 # === THREAD STANDARD: M8 × 1.25 (ISO 262) ===
 THREAD_STANDARD = "M8x1.25"
