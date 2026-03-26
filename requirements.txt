@@ -1,14 +1,16 @@
-# requirements.txt — ThreadVision AI Dependencies
-# Install: pip install -r requirements.txt
+# ThreadVision AI System Requirements
+# ===================================
+opencv-python-headless
+numpy
+scipy
 
-# === Cross-platform dependencies ===
-opencv-python>=4.8.0
-numpy>=1.24.0
-scipy>=1.11.0
-customtkinter>=5.2.0
-Pillow>=10.0.0
-pandas>=2.0.0
+# SAM Segmentation Layer (Optional)
+# Provides highly robust AI segmentation of bolts vs noisy backgrounds
+torch
+torchvision
+timm
+# Must be installed via git:
+# pip install git+https://github.com/ChaoningZhang/MobileSAM.git
 
-# === Raspberry Pi ONLY (uncomment on Pi) ===
-# picamera2>=0.3.12
-# RPi.GPIO>=0.7.1
+# NOTE: Download mobile_sam.pt (38MB) into the project root
+# https://github.com/ChaoningZhang/MobileSAM/raw/master/weights/mobile_sam.pt

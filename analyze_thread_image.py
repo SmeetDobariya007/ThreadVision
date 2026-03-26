@@ -1,5 +1,5 @@
 # ── TOP-LEVEL CONSTANTS (user-configurable) ───────────────────────
-ARUCO_MARKER_SIZE_MM  = 10.0     # Physical side length of printed ArUco marker
+ARUCO_MARKER_SIZE_MM  = 50.0     # Physical side length of printed ArUco marker
 FALLBACK_PIXEL_TO_MM  = 120.0    # Used if ArUco not detected (calibrate on real hardware)
 
 # ── PHYSICAL BOUNDS CHECKS ────────────────────────────────────────
@@ -26,6 +26,14 @@ try:
     TKINTER_AVAILABLE = True
 except ImportError:
     TKINTER_AVAILABLE = False
+
+# ── Optional MobileSAM import ─────────────────────────────────────
+SAM_SEGMENTOR = None
+try:
+    from sam_segmentor import SAMSegmentor
+    SAM_AVAILABLE = True
+except ImportError:
+    SAM_AVAILABLE = False
 
 ARUCO_DICT = aruco.DICT_4X4_50
 DEFAULT_STANDARD = "AUTO"
@@ -156,9 +164,12 @@ def _find_bolt_contour(edges, image_shape, PIXEL_TO_MM):
         area = w * h
         frame_area = image_shape[0] * image_shape[1]
         
-        if area > frame_area * 0.005 and (w > image_shape[1] * 0.1 or h > image_shape[0] * 0.1):
-            if 0.8 < w / h < 1.2:
-                continue
+        # WEAKNESS PATCHED: Lowered the aggressive minimum filter bounds 
+        # so smaller bolts (like M4 or those photographed far away) are not discarded.
+        if area > frame_area * 0.001 and (w > image_shape[1] * 0.05 or h > image_shape[0] * 0.05):
+            # WEAKNESS PATCHED: We used to drop perfect squares (assuming they were the ArUco marker).
+            # But a short, fat M10x10mm bolt is naturally square. Instead of completely dropping them, 
+            # we just append them. The ConvexHull operation will naturally wrap both the marker and the bolt.
             valid_conts.append(c)
 
     if not valid_conts:
@@ -237,7 +248,10 @@ def _measure_pitch(gray, bbox, PIXEL_TO_MM):
         profile = 255.0 - profile
         
     profile = scipy.ndimage.gaussian_filter1d(profile, sigma=2)
-    expected_pitch_px = 1.25 * PIXEL_TO_MM * 0.7
+    # WEAKNESS PATCHED: Expected pitch max filter previously assumed M8x1.25.
+    # If a fine-threaded M8x1.0 is scanned, it would drop legitimate peaks. 
+    # Lowered the expected baseline to 0.8 to heavily strengthen fine-pitch identification.
+    expected_pitch_px = 0.8 * PIXEL_TO_MM * 0.7
     min_distance = max(int(expected_pitch_px), 15)
     
     peaks, _ = scipy.signal.find_peaks(profile, height=np.percentile(profile, 60), distance=min_distance, prominence=10)
@@ -447,10 +461,16 @@ def check_tolerances(measurements, tolerances):
             res[dim] = "UNKNOWN"
     return res
 
-def build_annotations(image, bbox, PIXEL_TO_MM, confidence_str, corner_pts, results, vals, tols, p_y, conf):
+def build_annotations(image, bbox, PIXEL_TO_MM, confidence_str, corner_pts, results, vals, tols, p_y, conf, sam_mask=None, seg_method="Canny"):
     c, x, y, w, h = bbox
     out = image.copy()
     
+    if sam_mask is not None:
+        overlay = out.copy()
+        colored_mask = np.zeros_like(out)
+        colored_mask[sam_mask > 0] = (180, 0, 180)
+        cv2.addWeighted(colored_mask, 0.25, overlay, 0.75, 0, out)
+        
     # ArUco marker
     if len(corner_pts) == 4:
         cv2.polylines(out, [corner_pts.astype(np.int32)], True, (0, 200, 0), 2)
@@ -512,6 +532,7 @@ def build_annotations(image, bbox, PIXEL_TO_MM, confidence_str, corner_pts, resu
         
     cv2.rectangle(out, (0, 0), (W, 40), color, -1)
     cv2.putText(out, text, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,0), 2)
+    cv2.putText(out, f"Seg: {seg_method}", (W - 200, H - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
     
     # CONFIDENCE PANEL (Bottom Right)
     panel_x = W - 260
@@ -526,7 +547,7 @@ def build_annotations(image, bbox, PIXEL_TO_MM, confidence_str, corner_pts, resu
     
     return out
 
-def print_report(filepath, w, h, orient, was_rot, PIXEL_TO_MM, calibration_str, std_str, noise_lvl, noise_mode, vals, tols, results, conf, major_cs, minor_cs, pitch_cs, flank_cs, aruco_cs):
+def print_report(filepath, w, h, orient, was_rot, PIXEL_TO_MM, calibration_str, std_str, noise_lvl, noise_mode, vals, tols, results, conf, major_cs, minor_cs, pitch_cs, flank_cs, aruco_cs, seg_method):
     um_per_px = 1000.0 / PIXEL_TO_MM
     print("==========================================================================")
     print("  ThreadVision AI — Thread Measurement Report v4.2")
@@ -535,6 +556,7 @@ def print_report(filepath, w, h, orient, was_rot, PIXEL_TO_MM, calibration_str, 
     print(f"  Orientation: {orient} (auto-detected{rot_str})")
     print(f"  Calibration: {PIXEL_TO_MM:.2f} px/mm ({um_per_px:.2f} µm/px) — {calibration_str}")
     print(f"  Standard:    {std_str} (ISO 262)")
+    print(f"  Segmentation:{seg_method}")
     print(f"  Noise:       {noise_lvl:.1f} ({noise_mode})")
     print("==========================================================================")
     print("")
@@ -642,7 +664,34 @@ def analyze(args):
     edges, gray_prep = preprocess(image_norm, mode)
     
     try:
-        bbox, contour_cs = _find_bolt_contour(edges, gray_prep.shape, PIXEL_TO_MM)
+        sam_mask = None
+        seg_method = "Canny"
+        
+        if args.use_sam and SAM_AVAILABLE:
+            global SAM_SEGMENTOR
+            if SAM_SEGMENTOR is None:
+                try: SAM_SEGMENTOR = SAMSegmentor(args.sam_weights)
+                except Exception as e:
+                    print(f"WARNING: SAM load failed ({e}) — using Canny fallback")
+                    args.use_sam = False
+                    
+        if args.use_sam and getattr(sys.modules[__name__], 'SAM_SEGMENTOR', None) is not None:
+            prompt_pt = None
+            if args.sam_point:
+                px, py = args.sam_point.split(",")
+                prompt_pt = (int(px), int(py))
+            try:
+                bbox, sam_mask, contour_cs = SAM_SEGMENTOR.segment_bolt(
+                    image_norm, PIXEL_TO_MM, prompt_point=prompt_pt
+                )
+                seg_method = "SAM"
+            except Exception as e:
+                print(f"WARNING: SAM segmentation failed ({e}) — using Canny fallback")
+                bbox, contour_cs = _find_bolt_contour(edges, gray_prep.shape, PIXEL_TO_MM)
+                seg_method = "Canny (fallback)"
+        else:
+            bbox, contour_cs = _find_bolt_contour(edges, gray_prep.shape, PIXEL_TO_MM)
+            
     except Exception as e:
         print(f"Error finding bolt: {e}")
         return
@@ -669,7 +718,7 @@ def analyze(args):
         noise_mode=mode
     )
     
-    annotated = build_annotations(image_norm, bbox, PIXEL_TO_MM, confidence_str, corner_pts, results, vals, tolerances, p_y, conf)
+    annotated = build_annotations(image_norm, bbox, PIXEL_TO_MM, confidence_str, corner_pts, results, vals, tolerances, p_y, conf, sam_mask, seg_method)
     
     if was_rotated:
         annotated = cv2.rotate(annotated, cv2.ROTATE_90_COUNTERCLOCKWISE)
@@ -677,7 +726,7 @@ def analyze(args):
     save_path = args.save if args.save else f"{os.path.splitext(filepath)[0]}_analyzed.jpg"
     cv2.imwrite(save_path, annotated)
     
-    print_report(filepath, W, H, orient, was_rotated, PIXEL_TO_MM, confidence_str, std_name, noise_lvl, mode, vals, tolerances, results, conf, major_cs, minor_cs, pitch_cs, flank_cs, aruco_cs)
+    print_report(filepath, W, H, orient, was_rotated, PIXEL_TO_MM, confidence_str, std_name, noise_lvl, mode, vals, tolerances, results, conf, major_cs, minor_cs, pitch_cs, flank_cs, aruco_cs, seg_method)
     print(f"  Annotated image: {save_path}")
     
     csv_str = "not saved"
@@ -766,6 +815,9 @@ if __name__ == "__main__":
     parser.add_argument('--csv', type=str, default=None, help='CSV log path')
     parser.add_argument('--verbose', action='store_true', help='Verbose output')
     parser.add_argument('--no-fallback', action='store_true', help='No fallback for ArUco')
+    parser.add_argument('--use-sam', action='store_true', help='Use MobileSAM for bolt segmentation')
+    parser.add_argument('--sam-weights', type=str, default='mobile_sam.pt', help='Path to MobileSAM weights file')
+    parser.add_argument('--sam-point', type=str, default=None, help='Prompt point "x,y" inside bolt. Default: center')
     
     args = parser.parse_args()
     analyze(args)
