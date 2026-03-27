@@ -1,5 +1,5 @@
 # ── TOP-LEVEL CONSTANTS (user-configurable) ───────────────────────
-ARUCO_MARKER_SIZE_MM  = 50.0     # Physical side length of printed ArUco marker
+ARUCO_MARKER_SIZE_MM  = 21.0     # Physical side length of printed ArUco marker
 FALLBACK_PIXEL_TO_MM  = 120.0    # Used if ArUco not detected (calibrate on real hardware)
 
 # ── PHYSICAL BOUNDS CHECKS ────────────────────────────────────────
@@ -682,7 +682,9 @@ def analyze(args):
                 prompt_pt = (int(px), int(py))
             try:
                 bbox, sam_mask, contour_cs = SAM_SEGMENTOR.segment_bolt(
-                    image_norm, PIXEL_TO_MM, prompt_point=prompt_pt
+                    image_norm, PIXEL_TO_MM, 
+                    aruco_corners=corner_pts if len(corner_pts) == 4 else None,
+                    manual_point=prompt_pt
                 )
                 seg_method = "SAM"
             except Exception as e:
