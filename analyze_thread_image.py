@@ -158,31 +158,54 @@ def preprocess(image, mode):
 
 def _find_bolt_contour(edges, image_shape, PIXEL_TO_MM):
     contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    valid_conts = []
+    H, W = image_shape[0], image_shape[1]
+    frame_area = H * W
+
+    # Estimate ArUco marker pixel size so we can exclude it
+    # (ArUco is typically a square; we reject contours that look like it)
+    aruco_approx_px = None
+    if PIXEL_TO_MM and PIXEL_TO_MM > 0:
+        # PIXEL_TO_MM is px/mm; a 21mm marker would be ~21*PIXEL_TO_MM wide
+        aruco_approx_px = 21.0 * PIXEL_TO_MM
+
+    candidates = []
     for c in contours:
         x, y, w, h = cv2.boundingRect(c)
         area = w * h
-        frame_area = image_shape[0] * image_shape[1]
-        
-        # WEAKNESS PATCHED: Lowered the aggressive minimum filter bounds 
-        # so smaller bolts (like M4 or those photographed far away) are not discarded.
-        if area > frame_area * 0.001 and (w > image_shape[1] * 0.05 or h > image_shape[0] * 0.05):
-            # WEAKNESS PATCHED: We used to drop perfect squares (assuming they were the ArUco marker).
-            # But a short, fat M10x10mm bolt is naturally square. Instead of completely dropping them, 
-            # we just append them. The ConvexHull operation will naturally wrap both the marker and the bolt.
-            valid_conts.append(c)
 
-    if not valid_conts:
+        # --- Size filter: accept anything larger than 0.5% of frame ---
+        # (lowered from 5% so small/distant bolts are not discarded)
+        if area < frame_area * 0.005:
+            continue
+        if w < W * 0.01 or h < H * 0.01:
+            continue
+
+        # --- Exclude ArUco-like squares ---
+        squareness = min(w, h) / max(w, h) if max(w, h) > 0 else 0
+        if aruco_approx_px is not None:
+            aruco_tol = aruco_approx_px * 0.4
+            if squareness > 0.75 and abs(w - aruco_approx_px) < aruco_tol:
+                continue  # looks like the ArUco marker — skip
+
+        # --- Score by bolt-likeness: elongated is better ---
+        aspect = max(w, h) / max(min(w, h), 1)  # > 1 means elongated
+        bolt_score = area * aspect  # bigger + more elongated = higher score
+
+        candidates.append((bolt_score, c, x, y, w, h))
+
+    if not candidates:
         raise BoltNotFoundError("No valid bolt contour found in image.")
-    merged = np.vstack(valid_conts)
-    best_c = cv2.convexHull(merged)
-    x, y, w, h = cv2.boundingRect(best_c)
+
+    # Pick the highest-scoring single contour — do NOT merge via convexHull
+    # (merging caused the bbox to span background noise across the whole image)
+    candidates.sort(key=lambda t: t[0], reverse=True)
+    _, best_c, x, y, w, h = candidates[0]
     area = w * h
-    
-    aspect_ratio = float(h / w) if w > 0 else 0.0
+
+    aspect_ratio = float(max(w, h) / max(min(w, h), 1))
     bbox_fill = float(cv2.contourArea(best_c)) / area if area > 0 else 0.0
     conf_signals = {'aspect_ratio': aspect_ratio, 'bbox_fill': bbox_fill}
-    
+
     return (best_c, x, y, w, h), conf_signals
 
 def _measure_major_diameter(gray, bbox, PIXEL_TO_MM):
