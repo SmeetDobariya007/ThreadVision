@@ -63,20 +63,47 @@ def load_image(path):
     return image
 
 def normalize_orientation(image):
+    H, W = image.shape[:2]
+
+    # Portrait images (H > W): bolt is already vertical — never rotate.
+    # The measurement pipeline expects a vertical bolt, so portrait = correct.
+    if H >= W:
+        return image, False
+
+    # Landscape image: find the most bolt-like (elongated) contour to decide
+    # whether to rotate, ignoring square blobs (ArUco marker).
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
+
     if not contours:
         return image, False
-    
-    largest = max(contours, key=cv2.contourArea)
-    _, _, w, h = cv2.boundingRect(largest)
-    
-    if w > h:
+
+    # Pick the most elongated contour (ignoring square/ArUco-like blobs)
+    best = None
+    best_aspect = 1.0
+    for c in contours:
+        _, _, cw, ch = cv2.boundingRect(c)
+        if cw == 0 or ch == 0:
+            continue
+        squareness = min(cw, ch) / max(cw, ch)
+        if squareness > 0.7:
+            continue  # Skip square blobs (likely ArUco marker)
+        aspect = max(cw, ch) / min(cw, ch)
+        if aspect > best_aspect:
+            best_aspect = aspect
+            best = c
+
+    if best is None:
+        # Fallback: use the largest contour (original behaviour)
+        best = max(contours, key=cv2.contourArea)
+
+    _, _, w, h = cv2.boundingRect(best)
+    if w > h:  # bolt is lying horizontally → rotate to make it vertical
         rotated = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
         return rotated, True
     return image, False
+
 
 def unrotate_points(pts, original_shape, was_rotated):
     if not was_rotated:

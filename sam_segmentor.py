@@ -148,12 +148,26 @@ class SAMSegmentor:
         # Within the SAM mask, separate bolt (dark metal) from shadow
         # (lighter). Otsu threshold on the masked gray pixels.
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        masked_gray = gray.copy()
-        masked_gray[mask == 0] = 255  # set non-mask pixels to white
-        
-        # Otsu on the masked area to find dark-vs-light cutoff
+
+        # Detect if the image is already a silhouette (bi-modal: pure black + flat gray).
+        # Silhouette images have very low pixel std within the bolt region because
+        # everything is either 0 (bolt) or ~128 (background) with no gradients.
+        # In this case Otsu cannot split shadow from bolt — skip refinement.
         mask_pixels = gray[mask > 0]
+        is_silhouette = False
         if len(mask_pixels) > 100:
+            bg_pixels = gray[mask == 0]
+            bg_med = float(np.median(bg_pixels)) if len(bg_pixels) > 0 else 128.0
+            fg_std = float(np.std(mask_pixels))
+            # Silhouette: background is mid-gray (80-180), foreground has low std
+            if 60 < bg_med < 200 and fg_std < 40:
+                is_silhouette = True
+                logger.info(
+                    f"SAM: silhouette image detected (bg_med={bg_med:.0f}, fg_std={fg_std:.1f}) "
+                    f"— skipping Otsu refinement"
+                )
+
+        if not is_silhouette and len(mask_pixels) > 100:
             otsu_val, _ = cv2.threshold(
                 mask_pixels, 0, 255,
                 cv2.THRESH_BINARY + cv2.THRESH_OTSU
@@ -161,18 +175,17 @@ class SAMSegmentor:
             # Keep only pixels darker than the Otsu threshold
             refined = np.zeros_like(mask)
             refined[(mask > 0) & (gray < otsu_val)] = 255
-            
+
             # Morphological close to fill small gaps in bolt body
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
             refined = cv2.morphologyEx(refined, cv2.MORPH_CLOSE, kernel)
-            
+
             refined_coverage = np.count_nonzero(refined) / (H * W)
             logger.info(
                 f"SAM: mask refined by Otsu ({otsu_val:.0f}), "
                 f"coverage {coverage:.1%} → {refined_coverage:.1%}"
             )
-            
-            # Only use refined mask if it's reasonable (not too small)
+
             if refined_coverage > 0.003:
                 mask = refined
             else:
