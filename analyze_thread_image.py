@@ -35,6 +35,13 @@ try:
 except ImportError:
     SAM_AVAILABLE = False
 
+SILHOUETTE_MODE = False
+try:
+    from silhouette_preprocessor import generate_silhouette
+    SILHOUETTE_MODE = True
+except ImportError:
+    pass
+
 ARUCO_DICT = aruco.DICT_4X4_50
 DEFAULT_STANDARD = "AUTO"
 
@@ -541,13 +548,40 @@ def build_annotations(image, bbox, PIXEL_TO_MM, confidence_str, corner_pts, resu
     
     # Major/Minor
     my = y + int(0.3 * h)
-    cv2.line(out, (x, my), (x+w, my), (0, 255, 255), 2)
-    if vals.get('major'):
-        cv2.putText(out, f"Major: {vals['major']:.2f}mm {results['major']}", (x+w+10, my), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
     
-    cv2.line(out, (x+4, my+30), (x+w-4, my+30), (0, 165, 255), 2)
+    # Draw vertical bounding lines for Major Diameter
+    span = int(h * 0.4)
+    if vals.get('major'):
+        major_px = int(vals['major'] * PIXEL_TO_MM)
+        # Center the dimension lines horizontally in the bounding box
+        cx = x + w // 2
+        lx = cx - major_px // 2
+        rx = cx + major_px // 2
+        
+        # Red vertical bounding boxes
+        cv2.line(out, (lx, my - span), (lx, my + span), (0, 0, 255), 2)
+        cv2.line(out, (rx, my - span), (rx, my + span), (0, 0, 255), 2)
+        
+        # Dimension arrows <--> for Major
+        cv2.arrowedLine(out, (lx, my), (rx, my), (0, 255, 0), 2, tipLength=0.05)
+        cv2.arrowedLine(out, (rx, my), (lx, my), (0, 255, 0), 2, tipLength=0.05)
+        cv2.putText(out, f"Major: {vals['major']:.2f}mm {results['major']}", (rx+10, my), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+    else:
+        cv2.line(out, (x, my), (x+w, my), (0, 255, 255), 2)
+        
+    my_minor = my + 30
     if vals.get('minor'):
-        cv2.putText(out, f"Minor: {vals['minor']:.2f}mm {results['minor']}", (x+w+10, my+30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,165,255), 2)
+        minor_px = int(vals['minor'] * PIXEL_TO_MM)
+        cx = x + w // 2
+        lx = cx - minor_px // 2
+        rx = cx + minor_px // 2
+        
+        # Dimension arrows <--> for Minor
+        cv2.arrowedLine(out, (lx, my_minor), (rx, my_minor), (0, 165, 255), 2, tipLength=0.05)
+        cv2.arrowedLine(out, (rx, my_minor), (lx, my_minor), (0, 165, 255), 2, tipLength=0.05)
+        cv2.putText(out, f"Minor: {vals['minor']:.2f}mm {results['minor']}", (rx+10, my_minor), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,165,255), 2)
+    else:
+        cv2.line(out, (x+4, my_minor), (x+w-4, my_minor), (0, 165, 255), 2)
     
     # Pitch
     if vals.get('pitch'):
@@ -692,6 +726,10 @@ def analyze(args):
     
     image_norm, was_rotated = normalize_orientation(image)
     orient = "HORIZONTAL" if was_rotated else "VERTICAL"
+    
+    if getattr(args, 'silhouette', False) and SILHOUETTE_MODE:
+        print("Applying Silhouette Preprocessing...")
+        image_norm = generate_silhouette(image_norm)
     
     aruco_cs = None
     if args.calibration:
@@ -868,6 +906,7 @@ if __name__ == "__main__":
     parser.add_argument('--verbose', action='store_true', help='Verbose output')
     parser.add_argument('--no-fallback', action='store_true', help='No fallback for ArUco')
     parser.add_argument('--use-sam', action='store_true', help='Use MobileSAM for bolt segmentation')
+    parser.add_argument('--silhouette', action='store_true', help='Use high-contrast silhouette preprocessing')
     parser.add_argument('--sam-weights', type=str, default='mobile_sam.pt', help='Path to MobileSAM weights file')
     parser.add_argument('--sam-point', type=str, default=None, help='Prompt point "x,y" inside bolt. Default: center')
     

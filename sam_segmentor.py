@@ -113,6 +113,8 @@ class SAMSegmentor:
                 coords.append(pt)
                 labels.append(0)
                 border_negatives += 1
+                if border_negatives >= 2:
+                    break
                 
         logger.info(f"SAM: added {border_negatives} border negative prompts")
 
@@ -295,20 +297,30 @@ class SAMSegmentor:
         from scipy.ndimage import uniform_filter1d
         row_smooth = uniform_filter1d(row_transitions, size=max(1, H // 40))
 
-        # Sliding window on ROWS to find the thread-teeth band
-        # Use a proportional window: 1/12 of height covers most bolt diameters
-        win_r = max(1, H // 12)
-
-        if len(row_smooth) > win_r:
-            row_cum = np.cumsum(row_smooth)
-            row_sums = row_cum[win_r:] - np.concatenate([[0], row_cum[:-win_r-1]])
-            best_r_start = int(np.argmax(row_sums))
+        # Find the entire continuous block of high-transition rows (the threaded shaft)
+        # Threshold: 20% of the maximum transition count found in any row
+        max_trans = np.max(row_smooth)
+        threshold = max(2.0, max_trans * 0.20)
+        
+        # Identify all rows above threshold
+        high_trans_rows = np.where(row_smooth > threshold)[0]
+        
+        if len(high_trans_rows) > 0:
+            # Take the min and max row of the high-transition elements
+            # to define the start and end of the threaded region.
+            r1 = int(np.min(high_trans_rows))
+            r2 = int(np.max(high_trans_rows))
+            
+            # Ensure the band is at least a minimal height
+            if (r2 - r1) < (H // 12):
+                mid = (r1 + r2) // 2
+                r1 = max(0, mid - H // 24)
+                r2 = min(H, mid + H // 24)
         else:
-            best_r_start = 0
-
-        r1 = max(0, best_r_start)
-        r2 = min(H, best_r_start + win_r)
+            r1, r2 = 0, H // 12
+            
         best_row = (r1 + r2) // 2
+        win_r = r2 - r1  # effective window height for patch search later
 
         # Within the detected row band, find the COLUMN with highest
         # transition count — this is the bolt shaft, not the background.
@@ -337,7 +349,7 @@ class SAMSegmentor:
             prompt = (int(best_col), int(best_row))
 
         logger.info(
-            f"Edge-transition scan: band row={best_r_start}-{best_r_start+win_r}, "
+            f"Edge-transition scan: band row={r1}-{r2}, "
             f"best_col={best_col}, prompt={prompt}"
         )
 
